@@ -15,16 +15,12 @@ import numpy as np
 
 from app import config as app_config
 from app.tracking.base import Track
+from app.tracking.confirm import RawTrack, TrackConfirmer
 
 logger = logging.getLogger("rtsp-tracking.tracking.sam3")
 
 
-@dataclass(frozen=True, slots=True)
-class BackendTrack:
-    track_id: int
-    bbox: tuple[int, int, int, int]
-    polygon: list[tuple[int, int]] | None
-    score: float
+BackendTrack = RawTrack
 
 
 @dataclass(slots=True)
@@ -40,6 +36,8 @@ class Sam3Backend(Protocol):
     def create_session(self, camera_id: str, *, prompt: str, config: dict) -> Any: ...
 
     def update(self, handle: Any, frame: np.ndarray, ts: float) -> list[BackendTrack]: ...
+
+    def remove_object(self, handle: Any, track_id: int) -> None: ...
 
     def close(self, handle: Any) -> None: ...
 
@@ -93,6 +91,14 @@ def _prune_mapping(mapping: Any, limit: int) -> None:
         mapping.pop(key, None)
 
 
+def _prune_list_values(mapping: Any, limit: int) -> None:
+    if not isinstance(mapping, dict):
+        return
+    for values in mapping.values():
+        if isinstance(values, list) and len(values) > limit:
+            del values[:-limit]
+
+
 def prune_hf_session_memory(inference_session: Any, memory_bank_size: int) -> None:
     """Bound frame-indexed SAM3 session storage for long-running RTSP streams.
 
@@ -109,10 +115,22 @@ def prune_hf_session_memory(inference_session: Any, memory_bank_size: int) -> No
         _prune_mapping(per_object.get("non_cond_frame_outputs"), limit)
     for per_object in getattr(inference_session, "frames_tracked_per_obj", {}).values():
         _prune_mapping(per_object, limit)
-    for frame_scores in getattr(
-        inference_session, "obj_id_to_tracker_score_frame_wise", {}
-    ).values():
-        _prune_mapping(frame_scores, limit)
+    _prune_mapping(
+        getattr(inference_session, "obj_id_to_tracker_score_frame_wise", None),
+        limit,
+    )
+    _prune_mapping(
+        getattr(inference_session, "suppressed_obj_ids", None),
+        limit,
+    )
+    _prune_list_values(
+        getattr(inference_session, "unmatched_frame_inds", None),
+        limit,
+    )
+    _prune_list_values(
+        getattr(inference_session, "overlap_pair_to_frame_inds", None),
+        limit,
+    )
 
 
 class HFSam3Backend:
@@ -228,6 +246,44 @@ class HFSam3Backend:
         prune_hf_session_memory(inference_session, handle.memory_bank_size)
         return tracks
 
+    def remove_object(self, handle: Any, track_id: int) -> None:
+        inference_session = handle.inference_session
+        inference_session.remove_object(track_id, strict=False)
+
+        for attribute in (
+            "obj_id_to_score",
+            "obj_id_to_last_occluded",
+            "obj_first_frame_idx",
+            "unmatched_frame_inds",
+            "trk_keep_alive",
+        ):
+            mapping = getattr(inference_session, attribute, None)
+            if isinstance(mapping, dict):
+                mapping.pop(track_id, None)
+
+        frame_scores = getattr(
+            inference_session,
+            "obj_id_to_tracker_score_frame_wise",
+            None,
+        )
+        if isinstance(frame_scores, dict):
+            for frame_index, scores in list(frame_scores.items()):
+                if not isinstance(scores, dict):
+                    continue
+                scores.pop(track_id, None)
+                if not scores:
+                    frame_scores.pop(frame_index, None)
+
+        overlap_frames = getattr(
+            inference_session,
+            "overlap_pair_to_frame_inds",
+            None,
+        )
+        if isinstance(overlap_frames, dict):
+            for pair in list(overlap_frames):
+                if isinstance(pair, tuple) and track_id in pair:
+                    overlap_frames.pop(pair, None)
+
     def close(self, handle: Any) -> None:
         reset = getattr(handle.inference_session, "reset_state", None)
         if callable(reset):
@@ -248,16 +304,12 @@ class _Sam3Session:
         self._camera_id = camera_id
         self._prompt = prompt
         self._config = dict(config)
-        self._confirm_frames = max(1, int(confirm_frames))
-        self._track_state_ttl_frames = max(
-            1,
-            int(config.get("track_state_ttl_frames", 300)),
-        )
         self._handle = self._new_handle()
-        self._consecutive: dict[int, int] = {}
-        self._confirmed: set[int] = set()
-        self._announced: set[int] = set()
-        self._last_seen_frame: dict[int, int] = {}
+        self._confirmer = TrackConfirmer(
+            confirm_frames=confirm_frames,
+            ttl_frames=int(config.get("track_state_ttl_frames", 300)),
+            on_expire=self._expire_track,
+        )
         self._frame_index = 0
         self._closed = False
 
@@ -268,47 +320,15 @@ class _Sam3Session:
             config=dict(self._config),
         )
 
+    def _expire_track(self, track_id: int) -> None:
+        self._backend.remove_object(self._handle, track_id)
+
     def update(self, frame: np.ndarray, ts: float) -> list[Track]:
         if self._closed:
             raise RuntimeError("tracker session is closed")
         self._frame_index += 1
         raw_tracks = self._backend.update(self._handle, frame, ts)
-        current_ids = {item.track_id for item in raw_tracks}
-        for track_id in current_ids:
-            self._last_seen_frame[track_id] = self._frame_index
-        expired_ids = {
-            track_id
-            for track_id, last_seen in self._last_seen_frame.items()
-            if self._frame_index - last_seen > self._track_state_ttl_frames
-        }
-        for track_id in expired_ids:
-            self._last_seen_frame.pop(track_id, None)
-            self._consecutive.pop(track_id, None)
-            self._confirmed.discard(track_id)
-            self._announced.discard(track_id)
-        for track_id in list(self._consecutive):
-            if track_id not in current_ids and track_id not in self._confirmed:
-                self._consecutive.pop(track_id, None)
-
-        results: list[Track] = []
-        for item in raw_tracks:
-            if item.track_id not in self._confirmed:
-                count = self._consecutive.get(item.track_id, 0) + 1
-                self._consecutive[item.track_id] = count
-                if count < self._confirm_frames:
-                    continue
-                self._confirmed.add(item.track_id)
-            is_new = item.track_id not in self._announced
-            results.append(
-                Track(
-                    track_id=item.track_id,
-                    bbox=item.bbox,
-                    polygon=item.polygon,
-                    score=item.score,
-                    is_new=is_new,
-                )
-            )
-        return results
+        return self._confirmer.observe(self._frame_index, raw_tracks)
 
     def acknowledge_new_tracks(self, track_ids: list[int]) -> None:
         """Stop retrying ``is_new`` only after the parent persisted the crop.
@@ -319,21 +339,14 @@ class _Sam3Session:
         """
         if self._closed:
             return
-        self._announced.update(
-            int(track_id)
-            for track_id in track_ids
-            if int(track_id) in self._confirmed
-        )
+        self._confirmer.acknowledge_new_tracks(track_ids)
 
     def reset(self) -> None:
         if self._closed:
             raise RuntimeError("tracker session is closed")
         self._backend.close(self._handle)
         self._handle = self._new_handle()
-        self._consecutive.clear()
-        self._confirmed.clear()
-        self._announced.clear()
-        self._last_seen_frame.clear()
+        self._confirmer.reset()
         self._frame_index = 0
 
     def close(self) -> None:
@@ -341,10 +354,7 @@ class _Sam3Session:
             return
         self._closed = True
         self._backend.close(self._handle)
-        self._consecutive.clear()
-        self._confirmed.clear()
-        self._announced.clear()
-        self._last_seen_frame.clear()
+        self._confirmer.reset()
 
 
 class Sam3Adapter:

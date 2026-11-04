@@ -18,7 +18,7 @@ project_services() {
   #   native 는 mediamtx 를 호스트 게시포트로 호출(.env 의 docker DNS 값 override).
   # frontend: compose build.args 로 넘기던 VITE_* 를 dev 에선 env 로 주입.
   SERVICES=(
-    "backend|backend|source .venv/bin/activate && export MEDIAMTX_API='http://127.0.0.1:${MEDIAMTX_API_PORT}' && export MEDIAMTX_PATH_PREFIX=rtsp_tracking && alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT} --reload"
+    "backend|backend|source .venv/bin/activate && export YOLO_AUTOINSTALL=false && export MEDIAMTX_API='http://127.0.0.1:${MEDIAMTX_API_PORT}' && export MEDIAMTX_PATH_PREFIX=rtsp_tracking && alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT} --reload"
     "frontend|frontend|VITE_API_PORT='${BACKEND_PORT}' VITE_MEDIAMTX_WEBRTC_PORT='${MEDIAMTX_WEBRTC_PORT}' VITE_MEDIAMTX_VIEWER_USER='${MEDIAMTX_VIEWER_USER:-viewer_rtsp_tracking}' VITE_MEDIAMTX_VIEWER_PASS='${MEDIAMTX_VIEWER_PASS:-}' exec npm run dev -- --host 0.0.0.0 --port ${FRONTEND_PORT}"
   )
   PORTS=("${BACKEND_PORT}" "${FRONTEND_PORT}")

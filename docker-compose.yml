@@ -17,6 +17,8 @@ services:
     pull_policy: build
     container_name: rtsp-tracking-backend
     environment:
+      # 누락 패키지를 런타임에 pip 설치하지 않는다. requirements.txt 가 유일한 의존성 정본이다.
+      YOLO_AUTOINSTALL: "false"
       # SQLite DB 를 named volume 으로 — config.py 기본 경로 대신 override (spec Decision).
       DATABASE_URL: sqlite:////app/data/ipcam.db
       # config.py 가 읽는 등록 cap. 비우면 config 기본 16.

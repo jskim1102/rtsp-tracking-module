@@ -20,6 +20,7 @@ RUN apt-get update \
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    YOLO_AUTOINSTALL=false \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
@@ -27,6 +28,7 @@ WORKDIR /app
 
 # -----------------------------------------------------------------------------
 # 의존성 설치 (레이어 캐시 극대화)
+#   ultralytics tracker 의 lap 런타임은 requirements.txt 핀으로 함께 설치한다.
 #   ultralytics 가 X11 의존 opencv-python 을 함께 끌어와 우리가 명시한
 #   opencv-python-headless 의 cv2 를 덮어쓴다(headless 이미지에서 libxcb ImportError).
 #   → opencv-python 제거 후 headless 강제 재설치로 정리(deepeye Dockerfile 패턴).

@@ -19,8 +19,9 @@ interface Props {
 
 export const TRACKER_SLOTS: readonly TrackerSlot[] = [
   { name: "sam3", label: "SAM3" },
+  { name: "yolo-botsort", label: "YOLO+BoT-SORT" },
+  { name: "yolo-bytetrack", label: "YOLO+ByteTrack" },
   { name: "motip", label: "MOTIP" },
-  { name: "storm", label: "STORM" },
   { name: "samurai", label: "SAMURAI" },
 ];
 

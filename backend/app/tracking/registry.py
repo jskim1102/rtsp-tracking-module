@@ -8,13 +8,24 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 from app.tracking.base import TrackerAdapter
 from app.tracking.sam3_adapter import Sam3Adapter
+from app.tracking.ultralytics_adapter import UltralyticsTrackerAdapter
 
-_RESERVED = ("sam3", "motip", "storm", "samurai")
-_FACTORIES: dict[str, Callable[..., TrackerAdapter]] = {"sam3": Sam3Adapter}
+_RESERVED = ("sam3", "yolo-botsort", "yolo-bytetrack", "motip", "samurai")
+_FACTORIES: dict[str, Callable[..., TrackerAdapter]] = {
+    "sam3": Sam3Adapter,
+    "yolo-botsort": partial(UltralyticsTrackerAdapter, "yolo-botsort"),
+    "yolo-bytetrack": partial(UltralyticsTrackerAdapter, "yolo-bytetrack"),
+}
+_CAPABILITIES = {
+    "sam3": Sam3Adapter.capabilities,
+    "yolo-botsort": UltralyticsTrackerAdapter.capabilities,
+    "yolo-bytetrack": UltralyticsTrackerAdapter.capabilities,
+}
 
 
 def reserved_trackers() -> list[str]:
@@ -26,10 +37,10 @@ def available_trackers() -> list[str]:
 
 
 def tracker_capabilities(name: str) -> dict[str, bool]:
-    factory = _FACTORIES.get(name)
-    if factory is None:
+    capabilities = _CAPABILITIES.get(name)
+    if capabilities is None:
         raise ValueError(f"tracker is not available: {name}")
-    return dict(factory.capabilities)
+    return dict(capabilities)
 
 
 def create_tracker(name: str | None = None, **kwargs: Any) -> TrackerAdapter:

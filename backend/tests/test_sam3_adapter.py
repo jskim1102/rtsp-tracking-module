@@ -16,6 +16,7 @@ class FakeBackend:
     def __init__(self) -> None:
         self.created: list[tuple[str, str, dict]] = []
         self.closed: list[dict] = []
+        self.removed: list[tuple[dict, int]] = []
         self.frames: dict[str, list[list[BackendTrack]]] = {}
 
     def create_session(self, camera_id: str, *, prompt: str, config: dict):
@@ -26,6 +27,9 @@ class FakeBackend:
     def update(self, handle, frame: np.ndarray, ts: float) -> list[BackendTrack]:
         scripted = self.frames.setdefault(handle["camera_id"], [])
         return scripted.pop(0) if scripted else []
+
+    def remove_object(self, handle, track_id: int) -> None:
+        self.removed.append((handle, track_id))
 
     def close(self, handle) -> None:
         self.closed.append(handle)
@@ -152,6 +156,41 @@ def test_absent_confirmed_track_state_expires_and_can_be_announced_again():
     assert session.update(frame, 3.0) == []
     assert session.update(frame, 4.0) == []
     assert session.update(frame, 5.0)[0].is_new is True
+    assert [(handle["camera_id"], track_id) for handle, track_id in backend.removed] == [
+        ("cam", 7)
+    ]
+
+
+def test_track_reappearing_before_ttl_expiry_is_not_removed():
+    backend = FakeBackend()
+    backend.frames["cam"] = [[_raw()], [], [_raw()], [], []]
+    session = Sam3Adapter(backend=backend, confirm_frames=1).create_session(
+        "cam",
+        {"track_state_ttl_frames": 2},
+    )
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+
+    for frame_index in range(5):
+        session.update(frame, float(frame_index))
+
+    assert backend.removed == []
+
+
+def test_backend_update_still_runs_after_last_track_expires():
+    backend = FakeBackend()
+    backend.frames["cam"] = [[_raw()], [], [], [], [_raw(8)]]
+    session = Sam3Adapter(backend=backend, confirm_frames=1).create_session(
+        "cam",
+        {"track_state_ttl_frames": 2},
+    )
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+
+    assert session.update(frame, 1.0)[0].track_id == 7
+    assert session.update(frame, 2.0) == []
+    assert session.update(frame, 3.0) == []
+    assert session.update(frame, 4.0) == []
+    assert session.update(frame, 5.0)[0].track_id == 8
+    assert [track_id for _, track_id in backend.removed] == [7]
 
 
 def test_missing_hf_token_fails_clearly_without_fallback(monkeypatch):
@@ -182,8 +221,11 @@ def test_hf_session_frame_stores_are_pruned_to_the_memory_bank_size():
             0: {index: object() for index in range(10)},
         },
         obj_id_to_tracker_score_frame_wise={
-            7: {index: 0.9 for index in range(10)},
+            index: {7: 0.9} for index in range(10)
         },
+        suppressed_obj_ids={index: {7} for index in range(10)},
+        unmatched_frame_inds={7: list(range(10))},
+        overlap_pair_to_frame_inds={(7, 8): list(range(10))},
     )
 
     prune_hf_session_memory(session, 3)
@@ -192,7 +234,56 @@ def test_hf_session_frame_stores_are_pruned_to_the_memory_bank_size():
     assert list(session.output_dict_per_obj[0]["cond_frame_outputs"]) == [7, 8, 9]
     assert list(session.output_dict_per_obj[0]["non_cond_frame_outputs"]) == [7, 8, 9]
     assert list(session.frames_tracked_per_obj[0]) == [7, 8, 9]
-    assert list(session.obj_id_to_tracker_score_frame_wise[7]) == [7, 8, 9]
+    assert list(session.obj_id_to_tracker_score_frame_wise) == [7, 8, 9]
+    assert list(session.suppressed_obj_ids) == [7, 8, 9]
+    assert session.unmatched_frame_inds[7] == [7, 8, 9]
+    assert session.overlap_pair_to_frame_inds[(7, 8)] == [7, 8, 9]
+
+
+def test_hf_backend_remove_object_cleans_streaming_metadata_and_keeps_prompt():
+    class FakeInferenceSession:
+        def __init__(self) -> None:
+            self.obj_ids = [7]
+            self.prompts = {0: "person"}
+            self.max_obj_id = 7
+            self.obj_id_to_score = {7: 0.9, 8: 0.8}
+            self.obj_id_to_tracker_score_frame_wise = {
+                10: {7: 0.7, 8: 0.6},
+                11: {7: 0.5},
+            }
+            self.obj_id_to_last_occluded = {7: 9, 8: 8}
+            self.obj_first_frame_idx = {7: 1, 8: 2}
+            self.unmatched_frame_inds = {7: [9, 10], 8: [10]}
+            self.overlap_pair_to_frame_inds = {
+                (7, 8): [10],
+                (8, 9): [11],
+            }
+            self.trk_keep_alive = {7: 2, 8: 3}
+            self.remove_calls: list[tuple[int, bool]] = []
+            self.reset_called = False
+
+        def remove_object(self, obj_id: int, strict: bool = False) -> None:
+            self.remove_calls.append((obj_id, strict))
+            self.obj_ids.clear()
+            self.reset_called = True
+
+    inference_session = FakeInferenceSession()
+    backend = object.__new__(HFSam3Backend)
+    handle = SimpleNamespace(inference_session=inference_session)
+
+    backend.remove_object(handle, 7)
+
+    assert inference_session.remove_calls == [(7, False)]
+    assert inference_session.reset_called is True
+    assert inference_session.prompts == {0: "person"}
+    assert inference_session.max_obj_id == 7
+    assert inference_session.obj_id_to_score == {8: 0.8}
+    assert inference_session.obj_id_to_tracker_score_frame_wise == {10: {8: 0.6}}
+    assert inference_session.obj_id_to_last_occluded == {8: 8}
+    assert inference_session.obj_first_frame_idx == {8: 2}
+    assert inference_session.unmatched_frame_inds == {8: [10]}
+    assert inference_session.overlap_pair_to_frame_inds == {(8, 9): [11]}
+    assert inference_session.trk_keep_alive == {8: 3}
 
 
 def test_hf_backend_uses_monotonic_frame_indices_after_memory_pruning():

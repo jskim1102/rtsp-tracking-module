@@ -13,6 +13,8 @@ pytest
 # Linux x86_64 에서 CUDA cu12 런타임 휠을 함께 끌어옴(GPU 자동사용, 미존재 시 CPU 폴백).
 # opencv 는 headless(서버/컨테이너 X11 비의존). multipart=custom .pt 업로드, websockets=detection WS.
 ultralytics==8.4.41
+# Ultralytics BoT-SORT/ByteTrack linear-assignment runtime (AutoUpdate otherwise).
+lap==0.5.13
 torch==2.7.1
 torchvision==0.22.1
 opencv-python-headless==4.13.0.92
